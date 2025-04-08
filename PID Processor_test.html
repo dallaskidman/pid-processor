@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>FamilySearch PID Processor</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    input, button, select { margin: 10px 0; padding: 10px; font-size: 1rem; }
+    #progress-bar { width: 100%; background-color: #f3f3f3; }
+    #progress { width: 0; height: 25px; background-color: #4caf50; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    th, td { padding: 8px; text-align: left; border: 1px solid #ddd; }
+    th.sticky { position: sticky; top: 0; background-color: #f2f2f2; z-index: 1; }
+    #output { max-height: 300px; overflow-y: scroll; }
+    #log { width: 100%; height: 150px; background: #000; color: #0f0; font-family: monospace; padding: 10px; overflow-y: scroll; }
+    .dropdown-content input { margin-right: 10px; }
+    .dropdown-content label { display: block; margin-bottom: 5px; }
+    .dropdown:hover .dropdown-content { display: block; }
+    .dropdown { position: relative; display: inline-block; }
+    .dropdown-content {
+      display: none;
+      position: absolute;
+      background-color: #f9f9f9;
+      box-shadow: 0px 8px 16px rgba(0,0,0,0.2);
+      z-index: 1;
+      padding: 12px;
+    }
+  </style>
+</head>
+<body>
+
+<h1>FamilySearch PID Processor</h1>
+
+<button id="fs-login">Login with FamilySearch</button>
+<p id="user-name"></p>
+
+<label for="auth-code">Access Token (Auto-Filled):</label>
+<input type="text" id="auth-code" readonly>
+
+<br>
+
+<label for="pid-file">Upload CSV File of PIDs:</label>
+<input type="file" id="pid-file" accept=".csv">
+
+<br>
+
+<button onclick="startProcessing()">Start Processing</button>
+<button onclick="toggleTerminal()">Hide Terminal</button>
+
+<div id="progress-bar"><div id="progress"></div></div>
+<p id="pid-counter">Processed 0 of 0 PIDs</p>
+
+<div class="dropdown">
+  <button>Toggle Columns</button>
+  <div class="dropdown-content">
+    <label><input type="checkbox" checked onchange="toggleColumn(4)"> Birth Date</label>
+    <label><input type="checkbox" checked onchange="toggleColumn(6)"> Christening Date</label>
+    <label><input type="checkbox" checked onchange="toggleColumn(8)"> Death Date</label>
+    <label><input type="checkbox" checked onchange="toggleColumn(12)"> Ordinance Status</label>
+    <label><input type="checkbox" checked onchange="toggleColumn(13)"> Source Titles</label>
+    <label><input type="checkbox" checked onchange="toggleColumn(14)"> Duplicates</label>
+    <label><input type="checkbox" checked onchange="toggleColumn(17)"> Record Hint Titles</label>
+  </div>
+</div>
+
+<div>
+  <label for="filter-field">Filter by:</label>
+  <select id="filter-field">
+    <option value="Ordinance Status">Ordinance Status</option>
+    <option value="Source Titles">Source Titles</option>
+    <option value="Record Hint Titles">Record Hint Titles</option>
+    <option value="Duplicates">Duplicates</option>
+  </select>
+
+  <input type="text" id="filter-value" placeholder="Enter filter value">
+  <button onclick="applyFilter()">Apply Filter</button>
+  <button onclick="resetFilter()">Reset Filter</button>
+</div>
+
+<div id="filter-summary"></div>
+
+<div id="output">
+  <table id="result-table">
+    <thead>
+      <tr>
+        <th class="sticky">#</th>
+        <th class="sticky">PID</th>
+        <th class="sticky">Sex</th>
+        <th class="sticky">Given Name</th>
+        <th class="sticky">Birth Date</th>
+        <th class="sticky">Birth Place</th>
+        <th class="sticky">Christening Date</th>
+        <th class="sticky">Christening Place</th>
+        <th class="sticky">Death Date</th>
+        <th class="sticky">Death Place</th>
+        <th class="sticky">Father</th>
+        <th class="sticky">Mother</th>
+        <th class="sticky">Ordinance Status</th>
+        <th class="sticky">Source Titles</th>
+        <th class="sticky">Duplicates</th>
+        <th class="sticky">Duplicate of Father</th>
+        <th class="sticky">Duplicate of Mother</th>
+        <th class="sticky">Record Hint Titles</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<textarea id="log" readonly></textarea>
+<button onclick="downloadCSV()">Download CSV</button>
+
+<script>
+const appKey = 'fs-internal-dev-key-000220';
+const redirectUri = window.location.origin + window.location.pathname;
+const authUrl = `https://ident.familysearch.org/cis-web/oauth2/v3/authorization?response_type=code&scope=openid%20profile%20email&client_id=${appKey}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+let results = [], pidData = [], currentIndex = 0, totalPIDs = 0;
+
+document.getElementById('fs-login').addEventListener('click', () => window.location.href = authUrl);
+
+window.addEventListener('DOMContentLoaded', () => {
+  const token = localStorage.getItem('fs_token');
+  const user = localStorage.getItem('fs_user');
+  if (token && user) {
+    document.getElementById('auth-code').value = token;
+    document.getElementById('user-name').textContent = `Welcome back, ${JSON.parse(user).name}`;
+    const file = document.getElementById('pid-file').files[0];
+    if (file) {
+      logToTerminal("📁 File already selected. Starting processing...");
+      startProcessing();
+    }
+  }
+});
+
+const code = new URLSearchParams(window.location.search).get('code');
+if (code) {
+  fetch(`https://ident.familysearch.org/cis-web/oauth2/v3/token?redirect_uri=${encodeURIComponent(redirectUri)}`, {
+    method: "POST",
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=authorization_code&code=${code}&client_id=${appKey}`
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.id_token) {
+      const jwt = JSON.parse(atob(data.id_token.split('.')[1]));
+      localStorage.setItem('fs_token', data.access_token);
+      localStorage.setItem('fs_user', JSON.stringify(jwt));
+      document.getElementById('auth-code').value = data.access_token;
+      document.getElementById('user-name').textContent = `Welcome, ${jwt.name}`;
+      logToTerminal("✅ Logged in as: " + jwt.name);
+      cleanURL();
+      const file = document.getElementById('pid-file').files[0];
+      if (file) {
+        logToTerminal("📁 File already selected. Starting processing...");
+        startProcessing();
+      }
+    }
+  })
+  .catch(err => logToTerminal("Auth error: " + err));
+}
+
+function cleanURL() {
+  if (window.history.replaceState) {
+    const url = new URL(window.location.href);
+    url.searchParams.delete('code');
+    window.history.replaceState({}, document.title, url.pathname);
+  }
+}
+
+function logToTerminal(msg) {
+  const el = document.getElementById('log');
+  el.value += msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+function toggleTerminal() {
+  document.getElementById('log').classList.toggle('hidden');
+}
+
+function toggleColumn(index) {
+  document.querySelectorAll(`#result-table tr`).forEach(row => {
+    const cell = row.cells[index];
+    if (cell) cell.style.display = cell.style.display === 'none' ? '' : 'none';
+  });
+}
+
+function applyFilter() {
+  const field = document.getElementById('filter-field').value;
+  const value = document.getElementById('filter-value').value.toLowerCase();
+  const index = { "Ordinance Status": 12, "Source Titles": 13, "Duplicates": 14, "Record Hint Titles": 17 }[field];
+  let match = 0;
+  document.querySelectorAll('#result-table tbody tr').forEach(row => {
+    const cell = row.cells[index]?.textContent.toLowerCase() || '';
+    const show = cell.includes(value);
+    row.style.display = show ? '' : 'none';
+    if (show) match++;
+  });
+  document.getElementById('filter-summary').textContent = `${match} rows match filter.`;
+}
+
+function resetFilter() {
+  document.querySelectorAll('#result-table tbody tr').forEach(r => r.style.display = '');
+  document.getElementById('filter-summary').textContent = '';
+  document.getElementById('filter-value').value = '';
+}
+
+async function fetchWithRetries(url, headers, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, { headers });
+      if (res.ok) return await res.json();
+      if (res.status === 429) await new Promise(r => setTimeout(r, 1000));
+    } catch (e) { logToTerminal(`Fetch error: ${e}`); }
+  }
+  return null;
+}
+
+function getFact(facts, type) {
+  return facts?.find(f => f.type.includes(type)) || {};
+}
+
+async function fetchAllData(pid, token) {
+  const auth = { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' };
+  const ordAuth = { 'Authorization': `Bearer ${token}`, 'User-Agent': 'Mozilla/5.0' };
+
+  const [person, parents, sources, ord, dupTree, dupRec] = await Promise.all([
+    fetchWithRetries(`https://api.familysearch.org/platform/tree/persons/${pid}`, auth),
+    fetchWithRetries(`https://api.familysearch.org/platform/tree/persons/${pid}/parents`, auth),
+    fetchWithRetries(`https://api.familysearch.org/platform/tree/persons/${pid}/sources`, auth),
+    fetchWithRetries(`https://www.familysearch.org/service/tree/tree-data/v8/person/${pid}/card?includeTempleRollupStatus=true`, ordAuth),
+    fetchWithRetries(`https://api.familysearch.org/platform/tree/persons/${pid}/matches?collection=tree`, auth),
+    fetchWithRetries(`https://api.familysearch.org/platform/tree/persons/${pid}/matches?collection=records`, auth)
+  ]);
+
+  const p = person?.persons?.[0] || {};
+  const facts = p.facts || [];
+
+  return {
+    pid,
+    sex: p.gender?.type?.split('/').pop() || 'N/A',
+    givenName: p.names?.[0]?.nameForms?.[0]?.parts?.find(p => p.type.includes('Given'))?.value || 'N/A',
+    birthDate: getFact(facts, 'Birth')?.date?.original || '',
+    birthPlace: getFact(facts, 'Birth')?.place?.original || '',
+    christeningDate: getFact(facts, 'Christening')?.date?.original || '',
+    christeningPlace: getFact(facts, 'Christening')?.place?.original || '',
+    deathDate: getFact(facts, 'Death')?.date?.original || '',
+    deathPlace: getFact(facts, 'Death')?.place?.original || '',
+    father: parents?.persons?.find(p => p.gender?.type?.includes('Male'))?.display?.name || 'N/A',
+    mother: parents?.persons?.find(p => p.gender?.type?.includes('Female'))?.display?.name || 'N/A',
+    ordinanceStatus: ord?.templeRollupStatus || 'N/A',
+    sourceTitles: sources?.sourceDescriptions?.map(s => s.titles?.map(t => t.value).join(', ')).join('; ') || 'None',
+    duplicates: dupTree?.results?.map(r => r.person?.id).join(', ') || 'None',
+    duplicateOfFather: '',
+    duplicateOfMother: '',
+    recordHintTitles: dupRec?.entries?.map(e => e.title).join('; ') || 'None'
+  };
+}
+
+async function startProcessing() {
+  const token = document.getElementById('auth-code').value.trim();
+  const file = document.getElementById('pid-file').files[0];
+  if (!token || !file) return alert("Auth token and file are required.");
+
+  const text = await file.text();
+  pidData = text.split('\n').map(l => l.trim()).filter(Boolean);
+  totalPIDs = pidData.length;
+  currentIndex = 0;
+  results = [];
+
+  for (const pid of pidData) {
+    logToTerminal(`Processing ${pid}`);
+    const data = await fetchAllData(pid, token);
+    data.rowIndex = ++currentIndex;
+    results.push(data);
+    updateTable(data);
+    document.getElementById('pid-counter').textContent = `Processed ${currentIndex} of ${totalPIDs} PIDs`;
+    document.getElementById('progress').style.width = `${(currentIndex / totalPIDs) * 100}%`;
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  logToTerminal("✅ Done.");
+}
+
+function updateTable(d) {
+  const tr = document.querySelector("#result-table tbody").insertRow();
+  tr.insertCell().textContent = d.rowIndex;
+  tr.insertCell().innerHTML = `<a href="https://www.familysearch.org/tree/person/${d.pid}" target="_blank">${d.pid}</a>`;
+  tr.insertCell().textContent = d.sex;
+  tr.insertCell().textContent = d.givenName;
+  tr.insertCell().textContent = d.birthDate;
+  tr.insertCell().textContent = d.birthPlace;
+  tr.insertCell().textContent = d.christeningDate;
+  tr.insertCell().textContent = d.christeningPlace;
+  tr.insertCell().textContent = d.deathDate;
+  tr.insertCell().textContent = d.deathPlace;
+  tr.insertCell().textContent = d.father;
+  tr.insertCell().textContent = d.mother;
+  tr.insertCell().textContent = d.ordinanceStatus;
+  tr.insertCell().textContent = d.sourceTitles;
+  tr.insertCell().textContent = d.duplicates;
+  tr.insertCell().textContent = d.duplicateOfFather;
+  tr.insertCell().textContent = d.duplicateOfMother;
+  tr.insertCell().textContent = d.recordHintTitles;
+}
+
+function downloadCSV() {
+  let csv = "Row,PID,Sex,Given Name,Birth Date,Birth Place,Christening Date,Christening Place,Death Date,Death Place,Father,Mother,Ordinance Status,Source Titles,Duplicates,Duplicate of Father,Duplicate of Mother,Record Hint Titles\n";
+  results.forEach(r => {
+    csv += `${r.rowIndex},"${r.pid}","${r.sex}","${r.givenName}","${r.birthDate}","${r.birthPlace}","${r.christeningDate}","${r.christeningPlace}","${r.deathDate}","${r.deathPlace}","${r.father}","${r.mother}","${r.ordinanceStatus}","${r.sourceTitles}","${r.duplicates}","${r.duplicateOfFather}","${r.duplicateOfMother}","${r.recordHintTitles}"\n`;
+  });
+  const link = document.createElement('a');
+  link.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  link.download = 'pid_results.csv';
+  link.click();
+}
+</script>
+
+</body>
+</html>
